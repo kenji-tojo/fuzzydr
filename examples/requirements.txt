@@ -1,0 +1,5 @@
+# Extra packages used by the example scripts (fuzzydr itself needs only torch).
+imageio[ffmpeg]>=2.30
+matplotlib>=3.5
+largesteps>=0.2.1
+tqdm>=4.60

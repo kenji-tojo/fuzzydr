@@ -1,0 +1,22 @@
+# Python
+__pycache__/
+*.py[cod]
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+*.so
+
+# Compiled shaders (SPIR-V)
+*.spv
+
+# Environments
+venv/
+.venv/
+env/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store

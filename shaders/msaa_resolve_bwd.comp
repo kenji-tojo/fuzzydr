@@ -1,0 +1,100 @@
+// shaders/msaa_resolve_bwd.comp
+//
+// MSAA pixel reconstruction filter (backward / adjoint).
+//
+// For each high-res input pixel (sx, sy), accumulates the gradient
+// contributions from every output pixel whose reconstruction filter
+// included this sample:
+//
+//   grad_in[sy][sx] = sum_{ox,oy}  w(sx,sy,ox,oy) / W(ox,oy) * grad_out[oy][ox]
+//
+// where w is the isotropic Gaussian weight and W is the per-output-pixel
+// normalisation sum (recomputed here to stay consistent with the forward).
+//
+// Push constants - same struct as the forward pass:
+//   out_width, out_height - output (half-res) dimensions
+//   sigma                 - Gaussian sigma in *output* pixels
+//
+// Binding 0 (readonly):  grad_out [out_height, out_width, 3] float
+// Binding 1 (writeonly): grad_in  [in_height,  in_width,  4] float  (in = 2x out;
+//                         channel 3 is written as 0 so grad shapes match the
+//                         4-channel rasterizer output layout).
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(push_constant) uniform Push {
+    uint  out_width;
+    uint  out_height;
+    float sigma;
+};
+
+layout(set = 0, binding = 0) readonly  buffer InBuf  { float data[]; } gradOut;
+layout(set = 0, binding = 1) writeonly buffer OutBuf { float data[]; } gradIn;
+
+#define R 2   // must match msaa_resolve_fwd.comp
+
+void main() {
+    uint in_w = out_width  * 2u;
+    uint in_h = out_height * 2u;
+
+    uint sx = gl_GlobalInvocationID.x;
+    uint sy = gl_GlobalInvocationID.y;
+    if (sx >= in_w || sy >= in_h) return;
+
+    float sigma_hr = sigma * 2.0;
+    float inv_2s2  = 1.0 / (2.0 * sigma_hr * sigma_hr);
+
+    // Determine which output pixels' filters include input pixel (sx, sy).
+    // Forward samples sx in [2*ox - R, 2*ox + 1 + R], so:
+    //   ox_min = ceil((sx - 1 - R) / 2),  ox_max = floor((sx + R) / 2)
+    int ox0 = max((int(sx) - 1 - R + 1) / 2, 0);            // ceil division
+    int ox1 = min((int(sx) + R) / 2, int(out_width)  - 1);
+    int oy0 = max((int(sy) - 1 - R + 1) / 2, 0);
+    int oy1 = min((int(sy) + R) / 2, int(out_height) - 1);
+
+    float px = float(sx) + 0.5;   // input sample centre
+    float py = float(sy) + 0.5;
+
+    vec3 grad = vec3(0.0);
+
+    for (int oy = oy0; oy <= oy1; ++oy) {
+        float cy = float(2 * oy) + 1.0;
+        for (int ox = ox0; ox <= ox1; ++ox) {
+            float cx = float(2 * ox) + 1.0;
+
+            // Weight of *this* input pixel for output pixel (ox, oy).
+            float dx = px - cx;
+            float dy = py - cy;
+            float w  = exp(-(dx * dx + dy * dy) * inv_2s2);
+
+            // Recompute normalisation sum W for output pixel (ox, oy).
+            int isx0 = max(2 * ox - R, 0);
+            int isx1 = min(2 * ox + 1 + R, int(in_w) - 1);
+            int isy0 = max(2 * oy - R, 0);
+            int isy1 = min(2 * oy + 1 + R, int(in_h) - 1);
+
+            float W = 0.0;
+            for (int isy = isy0; isy <= isy1; ++isy) {
+                float ddy = float(isy) + 0.5 - cy;
+                for (int isx = isx0; isx <= isx1; ++isx) {
+                    float ddx = float(isx) + 0.5 - cx;
+                    W += exp(-(ddx * ddx + ddy * ddy) * inv_2s2);
+                }
+            }
+
+            float nw = w / max(W, 1e-12);
+
+            uint gi = (uint(oy) * out_width + uint(ox)) * 3u;
+            grad += nw * vec3(gradOut.data[gi],
+                              gradOut.data[gi + 1u],
+                              gradOut.data[gi + 2u]);
+        }
+    }
+
+    uint o = (sy * in_w + sx) * 4u;
+    gradIn.data[o]      = grad.x;
+    gradIn.data[o + 1u] = grad.y;
+    gradIn.data[o + 2u] = grad.z;
+    gradIn.data[o + 3u] = 0.0;  // alpha is not a learnable channel
+}

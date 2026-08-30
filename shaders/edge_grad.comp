@@ -1,0 +1,346 @@
+// shaders/edge_grad.comp
+#version 450
+#extension GL_EXT_shader_atomic_float : require
+
+layout(local_size_x = 16, local_size_y = 16, local_size_z = 1) in;
+
+// prim_id: uint32[H*W]
+layout(set = 0, binding = 0, std430) readonly buffer PrimIdBuf { uint prim_id[]; };
+
+// bary_depth: float32[H*W*4]
+//   channel.w encodes the primitive class (matches src/rasterize.cpp):
+//     0 = face        - (bary.x, bary.y, depth, 0.0)
+//     1 = bresen line - (s=0, t, depth, 1.0)
+//     2 = quad line   - (s,   t, depth, 2.0)     s is across-line, t is along-line
+//     3 = point       - (0,   0, depth, 3.0)
+layout(set = 0, binding = 1, std430) readonly buffer BaryBuf { float bary[]; };
+
+// faces: uint32[M*3]
+layout(set = 0, binding = 2, std430) readonly buffer FaceBuf { uint faces[]; };
+
+// vert_attrs: float32[N*7] = (x,y,z,radius,r,g,b)
+//   The `radius` slot is the world-space cylinder radius of a quad line
+//   (prim_type == 2u).  Faces, bresen lines, and points do not use it, so no
+//   radius gradient is emitted for them.
+layout(set = 0, binding = 3, std430) readonly buffer VertAttrBuf { float vattr[]; };
+
+// out_rgba (cached): float32[H*W*4]
+layout(set = 0, binding = 4, std430) readonly buffer OutBuf { float outRgba[]; };
+
+// grad_out_rgba: float32[H*W*4]
+layout(set = 0, binding = 5, std430) readonly buffer GradOutBuf { float gOutRgba[]; };
+
+// grad_vert_attrs: float32[N*7]
+layout(set = 0, binding = 6, std430) buffer GradVertAttrBuf { float gAttr[]; };
+
+// lines: uint32[L*2]
+layout(set = 0, binding = 7, std430) readonly buffer LineBuf { uint lines[]; };
+
+// points: uint32[P]
+layout(set = 0, binding = 9, std430) readonly buffer PointBuf { uint points[]; };
+
+// UBO with viewproj (reused from forward cache)
+layout(set = 0, binding = 8) uniform UBO {
+    mat4  viewproj;
+    vec3  campos;
+    float tau;
+    uint  seed;
+    uint  _pad0;
+    uint  _pad1;
+    uint  _pad2;
+} ubo;
+
+layout(push_constant) uniform Push {
+    uint width;
+    uint height;
+} pc;
+
+uint pixIdx(uint x, uint y) { return y * pc.width + x; }
+
+// Analytic screen-pixels-per-unit-radius at a line endpoint.
+// Mirrors the right-vector construction in rasterize_line_quads.vert, then
+// differentiates the perspective projection analytically:
+//   d(ndc)/d(delta)    = (right_clip.xy - ndc * right_clip.w) / clip.w
+//   d(screen)/d(delta) = d(ndc)/d(delta) * 0.5 * screenSize
+//   pxPerRad           = |d(screen)/d(delta)|
+float computePxPerRad(vec3 pos, vec4 clip, vec2 ndc,
+                      vec3 lineTan, vec2 screenSize) {
+    vec3 toCamera = ubo.campos - pos;
+    vec3 r = cross(lineTan, toCamera);
+    float rLen = length(r);
+    vec3 right = (rLen > 1e-12) ? (r / rLen) : vec3(0.0, 1.0, 0.0);
+
+    vec4 rightClip = ubo.viewproj * vec4(right, 0.0);
+    vec2 dNdc = (rightClip.xy - ndc * rightClip.w) / clip.w;
+    vec2 dScreen = dNdc * 0.5 * screenSize;
+    return length(dScreen);
+}
+
+// Transform a world-space position to clip space.
+vec4 worldToClip(uint vertIdx) {
+    vec3 world = vec3(vattr[vertIdx * 7u + 0u],
+                      vattr[vertIdx * 7u + 1u],
+                      vattr[vertIdx * 7u + 2u]);
+    return ubo.viewproj * vec4(world, 1.0);
+}
+
+void main() {
+    uint xA = gl_GlobalInvocationID.x;
+    uint yA = gl_GlobalInvocationID.y;
+    if (xA >= pc.width || yA >= pc.height) return;
+
+    uint pA = pixIdx(xA, yA);
+    uint prim = prim_id[pA];
+    if (prim == 0xFFFFFFFFu) return;
+
+    // A's bary/depth/prim_type
+    uint bA = pA * 4u;
+    float w0 = bary[bA + 0u];
+    float w1 = bary[bA + 1u];
+    float depthA = bary[bA + 2u];
+    uint prim_type = uint(bary[bA + 3u]);
+
+    // Determine vertex indices and weights based on primitive type.
+    uint i0, i1, i2;
+    float bw0, bw1, bw2;
+
+    if (prim_type == 0u) {
+        // Face: 3 vertices, barycentric weights
+        uint f = prim * 3u;
+        i0 = faces[f + 0u];
+        i1 = faces[f + 1u];
+        i2 = faces[f + 2u];
+        bw0 = w0;
+        bw1 = w1;
+        bw2 = 1.0 - w0 - w1;
+    } else if (prim_type == 3u) {
+        // Point: 1 vertex, all weight on i0.
+        i0 = points[prim];
+        i1 = i0;
+        i2 = i0;
+        bw0 = 1.0;
+        bw1 = 0.0;
+        bw2 = 0.0;
+    } else {
+        // Line (prim_type in {1, 2}): 2 vertices, along-line parameter t = w1 in [0,1].
+        uint li = prim * 2u;
+        i0 = lines[li + 0u];
+        i1 = lines[li + 1u];
+        i2 = i1;
+        float t = w1;
+        bw0 = 1.0 - t;
+        bw1 = t;
+        bw2 = 0.0;
+    }
+
+    // A colors + grad (RGB only; alpha is unused).
+    uint oA = pA * 4u;
+    float cAx = outRgba[oA + 0u];
+    float cAy = outRgba[oA + 1u];
+    float cAz = outRgba[oA + 2u];
+
+    float gAx = gOutRgba[oA + 0u];
+    float gAy = gOutRgba[oA + 1u];
+    float gAz = gOutRgba[oA + 2u];
+
+    // ------------------------------------------------------------
+    // Propagate pixel RGB gradient into vertex RGB (channels 4,5,6)
+    // via the barycentric/line interpolation weights.
+    // ------------------------------------------------------------
+    atomicAdd(gAttr[i0 * 7u + 4u], gAx * bw0);
+    atomicAdd(gAttr[i0 * 7u + 5u], gAy * bw0);
+    atomicAdd(gAttr[i0 * 7u + 6u], gAz * bw0);
+
+    atomicAdd(gAttr[i1 * 7u + 4u], gAx * bw1);
+    atomicAdd(gAttr[i1 * 7u + 5u], gAy * bw1);
+    atomicAdd(gAttr[i1 * 7u + 6u], gAz * bw1);
+
+    if (prim_type == 0u) {
+        atomicAdd(gAttr[i2 * 7u + 4u], gAx * bw2);
+        atomicAdd(gAttr[i2 * 7u + 5u], gAy * bw2);
+        atomicAdd(gAttr[i2 * 7u + 6u], gAz * bw2);
+    }
+
+    // ------------------------------------------------------------
+    // Edge gradient: silhouette-aware position gradient
+    // ------------------------------------------------------------
+
+    // Compute clip-space positions from world-space via viewproj
+    vec4 clip0 = worldToClip(i0);
+    vec4 clip1 = worldToClip(i1);
+
+    float p0x = clip0.x, p0y = clip0.y, p0w = clip0.w;
+    float p1x = clip1.x, p1y = clip1.y, p1w = clip1.w;
+
+    float p2x, p2y, p2w;
+    if (prim_type == 0u) {
+        vec4 clip2 = worldToClip(i2);
+        p2x = clip2.x; p2y = clip2.y; p2w = clip2.w;
+    } else {
+        p2x = 0.0; p2y = 0.0; p2w = 1.0; // unused
+    }
+
+    float den = bw0 * p0w + bw1 * p1w + bw2 * p2w;
+
+    // Avoid NaNs/Infs
+    if (abs(den) < 1e-12) return;
+
+    float inv_w = 1.0 / den;
+
+    float num_x = bw0 * p0x + bw1 * p1x + bw2 * p2x;
+    float num_y = bw0 * p0y + bw1 * p1y + bw2 * p2y;
+
+    // ------------------------------------------------------------
+    // For lines: precompute screen-space line normal, per-endpoint
+    // pxPerRad, and which side of the line center this pixel lies on.
+    // Used for the radius gradient at silhouette edges.
+    // ------------------------------------------------------------
+    vec2 line_normal = vec2(0.0);
+    float pxPerRad0 = 0.0;
+    float pxPerRad1 = 0.0;
+    float side_sign = 0.0;
+
+    // Both line types need the screen-space line normal and the per-endpoint
+    // pxPerRad for the silhouette finite-difference below.
+    if (prim_type == 1u || prim_type == 2u) {
+        vec2 screenSize = vec2(float(pc.width), float(pc.height));
+
+        vec2 ndc0 = clip0.xy / clip0.w;
+        vec2 ndc1 = clip1.xy / clip1.w;
+        vec2 screen0 = (ndc0 * 0.5 + 0.5) * screenSize;
+        vec2 screen1 = (ndc1 * 0.5 + 0.5) * screenSize;
+
+        vec2 screenDir = screen1 - screen0;
+        float screenLen = length(screenDir);
+        vec2 tangent = (screenLen > 1e-6)
+                       ? (screenDir / screenLen) : vec2(1.0, 0.0);
+        line_normal = vec2(-tangent.y, tangent.x);
+
+        // Which side of the line center is this pixel on?
+        vec2 toPixel = vec2(float(xA) + 0.5, float(yA) + 0.5) - screen0;
+        side_sign = sign(tangent.x * toPixel.y - tangent.y * toPixel.x);
+
+        // World-space line tangent for pxPerRad computation.
+        vec3 p0_world = vec3(vattr[i0 * 7u + 0u],
+                             vattr[i0 * 7u + 1u],
+                             vattr[i0 * 7u + 2u]);
+        vec3 p1_world = vec3(vattr[i1 * 7u + 0u],
+                             vattr[i1 * 7u + 1u],
+                             vattr[i1 * 7u + 2u]);
+        vec3 lineDir = p1_world - p0_world;
+        float lineLen = length(lineDir);
+        vec3 lineTan = (lineLen > 1e-12)
+                       ? (lineDir / lineLen) : vec3(1.0, 0.0, 0.0);
+
+        pxPerRad0 = computePxPerRad(p0_world, clip0, ndc0, lineTan, screenSize);
+        pxPerRad1 = computePxPerRad(p1_world, clip1, ndc1, lineTan, screenSize);
+    }
+
+    float dpix_dndc_x = 0.5 * float(pc.width);
+    float dpix_dndc_y = 0.5 * float(pc.height);
+
+    for (int e = 0; e < 4; ++e) {
+        // Normal directions for the 4-neighborhood micro-edges
+        //   e=0 -> (+1, 0)   e=1 -> (-1, 0)   e=2 -> (0, -1)   e=3 -> (0, +1)
+        int dx = (e < 2) ? (1 - 2 * e) : 0;
+        int dy = (e < 2) ? 0 : (2 * e - 5);
+
+        int xB = int(xA) + dx;
+        int yB = int(yA) + dy;
+        if (xB < 0 || xB >= int(pc.width) || yB < 0 || yB >= int(pc.height)) continue;
+
+        uint pB = pixIdx(uint(xB), uint(yB));
+
+        // visibility gate
+        uint primB = prim_id[pB];
+        float depthB = bary[pB * 4u + 2u];
+        uint prim_typeB = uint(bary[pB * 4u + 3u]);
+        if (!(primB == prim && prim_typeB == prim_type) && depthB <= depthA) continue;
+
+        // Detect silhouette edge: neighbor has a different primitive
+        bool is_silhouette = !(primB == prim && prim_typeB == prim_type);
+
+        // B colors + grad (RGB only)
+        uint oB = pB * 4u;
+        float cBx = outRgba[oB + 0u];
+        float cBy = outRgba[oB + 1u];
+        float cBz = outRgba[oB + 2u];
+
+        float gBx = gOutRgba[oB + 0u];
+        float gBy = gOutRgba[oB + 1u];
+        float gBz = gOutRgba[oB + 2u];
+
+        // adjoint from finite-difference color edge
+        float dL_dpix = 0.0;
+        dL_dpix += 0.5 * (gAx + gBx) * (cAx - cBx);
+        dL_dpix += 0.5 * (gAy + gBy) * (cAy - cBy);
+        dL_dpix += 0.5 * (gAz + gBz) * (cAz - cBz);
+
+        if (dL_dpix == 0.0) continue;
+
+        float dL_dndc_x = dL_dpix * float(dx) * dpix_dndc_x;
+        float dL_dndc_y = dL_dpix * float(dy) * dpix_dndc_y;
+
+        float dot_xy = num_x * dL_dndc_x + num_y * dL_dndc_y;
+        float inv_w2 = inv_w * inv_w;
+
+        // Clip-space gradient components per vertex, then back-propagate
+        // through viewproj to get world-space (x,y,z) gradients.
+        //
+        // For a vertex with barycentric weight bw:
+        //   dL/d(clip_x) = bw * inv_w * dL_dndc_x
+        //   dL/d(clip_y) = bw * inv_w * dL_dndc_y
+        //   dL/d(clip_z) = 0   (depth doesn't affect NDC x,y)
+        //   dL/d(clip_w) = -bw * dot_xy * inv_w^2
+        //
+        // World-space gradient: dL/d(pos_col) = dot(viewproj[col], dL_dclip)
+        //   where viewproj[col] is column col of the mat4.
+
+        // Vertex i0
+        {
+            vec4 gc = vec4(bw0 * inv_w * dL_dndc_x,
+                           bw0 * inv_w * dL_dndc_y,
+                           0.0,
+                           -bw0 * dot_xy * inv_w2);
+            atomicAdd(gAttr[i0 * 7u + 0u], dot(ubo.viewproj[0], gc));
+            atomicAdd(gAttr[i0 * 7u + 1u], dot(ubo.viewproj[1], gc));
+            atomicAdd(gAttr[i0 * 7u + 2u], dot(ubo.viewproj[2], gc));
+        }
+
+        // Vertex i1
+        {
+            vec4 gc = vec4(bw1 * inv_w * dL_dndc_x,
+                           bw1 * inv_w * dL_dndc_y,
+                           0.0,
+                           -bw1 * dot_xy * inv_w2);
+            atomicAdd(gAttr[i1 * 7u + 0u], dot(ubo.viewproj[0], gc));
+            atomicAdd(gAttr[i1 * 7u + 1u], dot(ubo.viewproj[1], gc));
+            atomicAdd(gAttr[i1 * 7u + 2u], dot(ubo.viewproj[2], gc));
+        }
+
+        // Vertex i2 (face only)
+        if (prim_type == 0u) {
+            vec4 gc = vec4(bw2 * inv_w * dL_dndc_x,
+                           bw2 * inv_w * dL_dndc_y,
+                           0.0,
+                           -bw2 * dot_xy * inv_w2);
+            atomicAdd(gAttr[i2 * 7u + 0u], dot(ubo.viewproj[0], gc));
+            atomicAdd(gAttr[i2 * 7u + 1u], dot(ubo.viewproj[1], gc));
+            atomicAdd(gAttr[i2 * 7u + 2u], dot(ubo.viewproj[2], gc));
+        }
+
+        // Radius gradient for quad lines at silhouette edges: project the
+        // pixel-space loss gradient onto the line's screen-space normal,
+        // scaled by side_sign and the per-endpoint pxPerRad.
+        if (prim_type == 2u && is_silhouette && side_sign != 0.0) {
+            vec2 dL_dpix_vec = dL_dpix * vec2(float(dx),
+                                               float(dy));
+            float dL_along_normal = dot(dL_dpix_vec, line_normal);
+
+            atomicAdd(gAttr[i0 * 7u + 3u],
+                      dL_along_normal * side_sign * bw0 * pxPerRad0);
+            atomicAdd(gAttr[i1 * 7u + 3u],
+                      dL_along_normal * side_sign * bw1 * pxPerRad1);
+        }
+    }
+}

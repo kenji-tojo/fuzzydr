@@ -1,0 +1,81 @@
+// shaders/msaa_resolve_fwd.comp
+//
+// MSAA pixel reconstruction filter (forward).
+//
+// Isotropic Gaussian weighted downsample from 2x supersampled input.
+// For each output pixel, samples the high-res input within a fixed radius,
+// weights by an isotropic Gaussian, and normalises.  The input's alpha
+// channel is ignored (the rasterizer pads it to 1).
+//
+//   out.rgb = (sum_i g_i * RGB_i) / sum_i g_i
+//
+// Push constants:
+//   out_width, out_height - output (half-res) dimensions
+//   sigma                 - Gaussian sigma in *output* pixels
+//
+// Binding 0 (readonly):  input  [in_height, in_width, 4]  float  (in = 2x out)
+// Binding 1 (writeonly): output [out_height, out_width, 3] float
+
+#version 450
+layout(local_size_x = 16, local_size_y = 16) in;
+
+layout(push_constant) uniform Push {
+    uint  out_width;
+    uint  out_height;
+    float sigma;          // in output pixels
+};
+
+layout(set = 0, binding = 0) readonly  buffer InBuf  { float data[]; } inBuf;
+layout(set = 0, binding = 1) writeonly buffer OutBuf { float data[]; } outBuf;
+
+// Tap radius in high-res pixels around the output-pixel centre.
+// R = 2 covers a 6x6 high-res neighbourhood (= +/-1 output pixel),
+// sufficient for sigma <= ~0.7 output pixels.
+#define R 2
+
+void main() {
+    uint ox = gl_GlobalInvocationID.x;
+    uint oy = gl_GlobalInvocationID.y;
+    if (ox >= out_width || oy >= out_height) return;
+
+    uint in_w = out_width  * 2u;
+    uint in_h = out_height * 2u;
+
+    // Centre of the output pixel in high-res pixel coordinates.
+    // Output pixel ox maps to high-res block [2*ox, 2*ox+1]; centre = 2*ox + 1.
+    float cx = float(2u * ox) + 1.0;
+    float cy = float(2u * oy) + 1.0;
+
+    float sigma_hr  = sigma * 2.0;                     // sigma in high-res pixels
+    float inv_2s2   = 1.0 / (2.0 * sigma_hr * sigma_hr);
+
+    // Tap bounds (clamped to image).
+    int sx0 = max(int(2u * ox) - R, 0);
+    int sx1 = min(int(2u * ox) + 1 + R, int(in_w) - 1);
+    int sy0 = max(int(2u * oy) - R, 0);
+    int sy1 = min(int(2u * oy) + 1 + R, int(in_h) - 1);
+
+    vec3  accum = vec3(0.0);
+    float wsum  = 0.0;
+
+    for (int sy = sy0; sy <= sy1; ++sy) {
+        float dy = float(sy) + 0.5 - cy;
+        for (int sx = sx0; sx <= sx1; ++sx) {
+            float dx = float(sx) + 0.5 - cx;
+            float w  = exp(-(dx * dx + dy * dy) * inv_2s2);
+
+            uint i = (uint(sy) * in_w + uint(sx)) * 4u;
+            accum += w * vec3(inBuf.data[i],
+                              inBuf.data[i + 1u],
+                              inBuf.data[i + 2u]);
+            wsum  += w;
+        }
+    }
+
+    vec3 result = accum / max(wsum, 1e-12);
+
+    uint o = (oy * out_width + ox) * 3u;
+    outBuf.data[o]      = result.x;
+    outBuf.data[o + 1u] = result.y;
+    outBuf.data[o + 2u] = result.z;
+}

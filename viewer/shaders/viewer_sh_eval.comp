@@ -1,0 +1,125 @@
+// shaders/viewer_sh_eval.comp
+//
+// Compute shader: evaluate SH16 (l=0..3, 16 coefficients) per vertex to
+// produce view-dependent RGB, then write a complete vert_attrs record
+// [x, y, z, radius, r, g, b] into evalBuf.
+//
+// Dispatch: ceil(nVerts / 256) groups of 256 threads.
+// All three output channels share the same 16 basis values computed once.
+//
+// SH coefficient layout expected in shBuf (matches fuzzydr / Python side):
+//   vertex i, channel c (0=R,1=G,2=B), coefficient k (0..15):
+//   shBuf[ i*48 + c*16 + k ]
+//   This is the flat layout of a [N, 3, 16] contiguous float32 tensor.
+//
+// SH16 basis - 3DGS / 3DGS-MCMC sign convention (see fuzzydr _eval_sh16).
+// View direction convention: d = normalize(pos - campos)   (camera -> surface).
+//   l=0 : Y_0  =  0.282095
+//   l=1 : Y_1  = -0.488603 * y
+//          Y_2  =  0.488603 * z
+//          Y_3  = -0.488603 * x
+//   l=2 : Y_4  =  1.092548 * x*y
+//          Y_5  = -1.092548 * y*z
+//          Y_6  =  0.315392 * (2z^2-x^2-y^2)
+//          Y_7  = -1.092548 * x*z
+//          Y_8  =  0.546274 * (x^2-y^2)
+//   l=3 : Y_9  = -0.590044 * y*(3x^2-y^2)
+//          Y_10 =  2.890611 * x*y*z
+//          Y_11 = -0.457046 * y*(4z^2-x^2-y^2)
+//          Y_12 =  0.373176 * z*(2z^2-3x^2-3y^2)
+//          Y_13 = -0.457046 * x*(4z^2-x^2-y^2)
+//          Y_14 =  1.445306 * z*(x^2-y^2)
+//          Y_15 = -0.590044 * x*(x^2-3y^2)
+
+#version 450
+layout(local_size_x = 256) in;
+
+// -- Bindings ------------------------------------------------------------------
+// binding 0 : original vert_attrs  float[nVerts * 7]  (xyz, radius, rgb[ignored])
+layout(set = 0, binding = 0) readonly buffer VertBuf {
+    float verts[];
+};
+
+// binding 1 : SH coefficients  float[nVerts * 48]  layout [N, 3, 16]
+layout(set = 0, binding = 1) readonly buffer ShBuf {
+    float sh[];
+};
+
+// binding 2 : evaluated output  float[nVerts * 7]  (xyz, radius, evaluated_rgb)
+layout(set = 0, binding = 2) writeonly buffer EvalBuf {
+    float eval[];
+};
+
+// -- Push constants ------------------------------------------------------------
+layout(push_constant) uniform PC {
+    vec3     campos;   // camera eye in world space
+    uint     nVerts;
+} pc;
+
+// -- SH basis evaluation -------------------------------------------------------
+void evalSH16(vec3 d, out float b[16]) {
+    float x = d.x, y = d.y, z = d.z;
+    float xx = x*x, yy = y*y, zz = z*z;
+    float xy = x*y, xz = x*z, yz = y*z;
+
+    b[ 0] =  0.282095;
+
+    b[ 1] = -0.488603 * y;
+    b[ 2] =  0.488603 * z;
+    b[ 3] = -0.488603 * x;
+
+    b[ 4] =  1.092548 * xy;
+    b[ 5] = -1.092548 * yz;
+    b[ 6] =  0.315392 * (2.0*zz - xx - yy);
+    b[ 7] = -1.092548 * xz;
+    b[ 8] =  0.546274 * (xx - yy);
+
+    b[ 9] = -0.590044 * y * (3.0*xx - yy);
+    b[10] =  2.890611 * xy * z;
+    b[11] = -0.457046 * y * (4.0*zz - xx - yy);
+    b[12] =  0.373176 * z * (2.0*zz - 3.0*xx - 3.0*yy);
+    b[13] = -0.457046 * x * (4.0*zz - xx - yy);
+    b[14] =  1.445306 * z * (xx - yy);
+    b[15] = -0.590044 * x * (xx - 3.0*yy);
+}
+
+// -- Main ----------------------------------------------------------------------
+void main() {
+    uint i = gl_GlobalInvocationID.x;
+    if (i >= pc.nVerts) return;
+
+    uint vbase = i * 7u;
+    float px = verts[vbase + 0u];
+    float py = verts[vbase + 1u];
+    float pz = verts[vbase + 2u];
+    float rad = verts[vbase + 3u];
+
+    // View direction: normalize(pos - campos)  (3DGS / training convention).
+    vec3 diff = vec3(px, py, pz) - pc.campos;
+    float len = length(diff);
+    vec3 vdir = (len > 1e-7) ? (diff / len) : vec3(0.0, 0.0, 1.0);
+
+    float b[16];
+    evalSH16(vdir, b);
+
+    // Buffer is stored transposed as [3, 16, N] for coalesced access:
+    // all threads at the same (c,k) step read consecutive addresses.
+    // Pre-clip to max(0, ...) per vertex (matches the training-side
+    // eval_sh_attrs which clamp_min(0)s before alpha compositing).
+    vec3 rgb;
+    for (int c = 0; c < 3; c++) {
+        float acc = 0.0;
+        for (int k = 0; k < 16; k++)
+            acc += sh[(uint(c) * 16u + uint(k)) * pc.nVerts + i] * b[k];
+        rgb[c] = max(0.5 + acc, 0.0);
+    }
+
+    uint obase = i * 7u;
+    eval[obase + 0u] = px;
+    eval[obase + 1u] = py;
+    eval[obase + 2u] = pz;
+    eval[obase + 3u] = rad;
+    eval[obase + 4u] = rgb.r;
+    eval[obase + 5u] = rgb.g;
+    eval[obase + 6u] = rgb.b;
+}
