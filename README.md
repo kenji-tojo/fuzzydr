@@ -9,9 +9,9 @@ It uses [Vulkan](https://vulkan.org/) for cross-platform, hardware-accelerated r
 
 FuzzyDR was originally developed as part of the ACM Transactions on Graphics paper [*Inverse Rendering for Modeling with Line Primitives*](https://kenji-tojo.github.io/sa26-line-primitives/).
 
-## Installation
+---
 
-### 0. Environment
+## Installation
 
 This guide assumes Linux or macOS and Python >= 3.10.
 
@@ -21,8 +21,6 @@ Create and activate a Python virtual environment using your preferred environmen
 python3 -m venv venv
 source ./venv/bin/activate
 ```
-
----
 
 ### 1. Install Vulkan
 
@@ -42,8 +40,6 @@ Adjust the version number (`1.4.350.1` above) to match the version you downloade
 
 *CUDA/Vulkan interoperability (optional):* If the CUDA Toolkit is installed and detected by CMake, interoperability between CUDA and Vulkan is automatically enabled. This allows `fuzzydr` to integrate efficiently with other parts of a training pipeline that use CUDA.
 
----
-
 ### 2. Install PyTorch (>= 2.1.0)
 
 Install [PyTorch](https://pytorch.org/get-started/locally/) according to your platform, GPU availability, and CUDA version. Since `fuzzydr` uses Vulkan for its core rendering and differentiation functionality, it can also work with a CPU-only build of PyTorch.
@@ -55,8 +51,6 @@ pip3 install torch torchvision
 ```
 
 Please refer to the [PyTorch installation guide](https://pytorch.org/get-started/locally/) for the appropriate command for your platform and CUDA version.
-
----
 
 ### 3. Install `fuzzydr`
 
@@ -76,11 +70,15 @@ pip3 install -v ./viewer/
 
 The viewer is standalone and can be built and installed without the main `fuzzydr` module.
 
+---
+
 ## Examples
 
 Now you are ready to develop and run your differentiable rendering code using `fuzzydr`.
 
 We provide [examples](examples/) demonstrating the main features of `fuzzydr`. For more complex reconstruction examples at scale, please also refer to [this project](https://github.com/kenji-tojo/inverse-line-primitives).
+
+---
 
 ## Multi-GPU Systems
 
@@ -96,6 +94,27 @@ export FUZZYDR_DEVICE_INDEX=1
 ```
 
 selects the same physical GPU on both sides. When using CUDA/Vulkan interoperability on a multi-GPU system, you may need to determine the corresponding CUDA and Vulkan device indices for your system.
+
+---
+
+## Gotcha
+
+The `fuzzydr` Vulkan backend assumes *one render per backward pass*. It caches internal buffers required for differentiation on each render, so rendering multiple views before calling `backward()` will not correctly propagate gradients through earlier renders.
+
+To accumulate gradients over multiple views before `optimizer.step()`, call `loss.backward()` for each view before rendering the next one, as in the following pseudocode:
+
+```python
+optimizer.zero_grad()
+
+for view in views:
+    image = render(view)
+    loss = compute_loss(image)
+    loss.backward()
+
+optimizer.step()
+```
+
+---
 
 ## Citation
 
