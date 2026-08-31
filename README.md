@@ -1,4 +1,4 @@
-# FuzzyDR
+# FuzzyDR: Differentiable Rasterizer with Stochastic Opacity Masking
 
 <img src="pics/opacity_tris.gif" alt="FuzzyDR teaser" width="40%">
 
